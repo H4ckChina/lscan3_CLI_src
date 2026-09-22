@@ -1,31 +1,13 @@
-# Linux Radmin service/version probe
+# Single-line progress output
 
-## Build
+The probe no longer needs to print a separate `[found]` line. Apply the change to an existing checkout with:
 
 ```sh
+cd lscan3_CLI_src
+./lscan3_CLI_src-master/apply_single_line_progress.sh lscan3_CLI_src-master/radmin_probe.c
+cd lscan3_CLI_src-master
 make -f Makefile.radmin_probe clean
 make -f Makefile.radmin_probe
 ```
 
-## Directory input mode
-
-The main program now accepts a directory with one `.txt` file per port. The filename without `.txt` must be a TCP port number, and each file contains one IPv4 address per line.
-
-Example:
-
-```text
-ports/
-├── 4899.txt
-├── 5000.txt
-└── 6000.txt
-```
-
-Run directly with the main program:
-
-```sh
-./radmin_probe -i ./ports -o ./results -t 2048 -w 3000
-```
-
-The program counts valid port files, sorts them numerically, and processes them sequentially. Results are written as `results/<version>/<port>.txt`, with one IP address per line.
-
-The probe performs only unauthenticated Radmin service/version detection; it does not attempt usernames, passwords, hashes, or login validation. Use it only on systems you own or are explicitly authorized to assess.
+The script creates `radmin_probe.c.bak`, removes the extra `[found]` newline output, and makes the progress line clear and repaint itself using `\033[2K\r`.
