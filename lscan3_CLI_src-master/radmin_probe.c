@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
@@ -26,6 +27,15 @@
 
 struct target { char ip[INET_ADDRSTRLEN]; };
 struct port_file { char name[256]; int port; };
+
+struct global_stats {
+    size_t checked;
+    size_t found;
+    size_t total;
+    struct timespec started;
+    pthread_mutex_t lock;
+};
+
 struct job {
     struct target *targets;
     size_t count;
@@ -35,12 +45,13 @@ struct job {
     int port;
     int timeout_ms;
     const char *output;
+    struct global_stats *g;
     struct timespec started;
     pthread_mutex_t lock;
 };
 
 static void usage(const char *name) {
-    fprintf(stderr, "Usage: %s -i input_dir [-o dir] [-t threads] [-w timeout_ms]\n", name);
+    fprintf(stderr, "Usage: %s -i input_dir [-o output_dir] [-t threads] [-w timeout_ms]\n", name);
     fprintf(stderr, "  input_dir contains port-named files such as 4899.txt\n");
 }
 
@@ -255,25 +266,26 @@ static void record_target(const struct job *j, const char *ip, const char *versi
 }
 
 static void print_progress_locked(const struct job *j) {
-    size_t remaining = j->count - j->completed;
-    double elapsed = elapsed_seconds(&j->started);
-    double rate = 0.0;
-    double eta = -1.0;
+    size_t checked = j->g ? j->g->checked : j->completed;
+    size_t found = j->g ? j->g->found : j->found;
+    size_t total = j->g ? j->g->total : j->count;
+    size_t remaining = total > checked ? total - checked : 0;
+    const struct timespec *start = j->g ? &j->g->started : &j->started;
+    double elapsed = elapsed_seconds(start);
+    double rate = elapsed > 0.0 ? (double)checked / elapsed : 0.0;
+    double eta = rate > 0.0 && remaining > 0 ? (double)remaining / rate : -1.0;
     char eta_text[32];
 
-    if (elapsed > 0.0) rate = (double)j->completed / elapsed;
-    if (rate > 0.0 && remaining > 0) eta = (double)remaining / rate;
     format_eta(eta, eta_text, sizeof(eta_text));
-
-    printf("\033[2K\r[progress] checked: %zu/%zu (%.2f%%) | remaining: %zu (%.2f%%) | rate: %.1f/s | ETA: %s | found: %zu",
-           j->completed,
-           j->count,
-           j->count ? 100.0 * (double)j->completed / (double)j->count : 100.0,
+    printf("\033[2K\r[overall] checked=%zu/%zu (%.2f%%) | remaining=%zu (%.2f%%) | rate=%.1f/s | ETA=%s | found=%zu",
+           checked,
+           total,
+           total ? 100.0 * (double)checked / (double)total : 100.0,
            remaining,
-           j->count ? 100.0 * (double)remaining / (double)j->count : 0.0,
+           total ? 100.0 * (double)remaining / (double)total : 0.0,
            rate,
            eta_text,
-           j->found);
+           found);
     fflush(stdout);
 }
 
@@ -297,10 +309,19 @@ static void *worker(void *arg) {
 
         pthread_mutex_lock(&j->lock);
         j->completed++;
+
+        if (j->g) {
+            pthread_mutex_lock(&j->g->lock);
+            j->g->checked++;
+            if (found) j->g->found++;
+            pthread_mutex_unlock(&j->g->lock);
+        }
+
         if (found) {
             record_target(j, j->targets[index].ip, version);
             j->found++;
         }
+
         print_progress_locked(j);
         pthread_mutex_unlock(&j->lock);
     }
@@ -390,10 +411,10 @@ static int count_valid_targets(const char *path, size_t *count_out) {
     return 0;
 }
 
-static int scan_file(const char *dir, const struct port_file *pf, const char *output, int threads, int timeout_ms) {
-    char path[1024];
+static int scan_file(const char *dir, const struct port_file *pf, const char *output,
+                     int threads, int timeout_ms, struct global_stats *g) {
+    char path[1024], line[MAX_LINE];
     FILE *fp;
-    char line[MAX_LINE];
     struct target *targets = NULL;
     size_t count = 0, cap = 0;
     struct job job;
@@ -445,7 +466,6 @@ static int scan_file(const char *dir, const struct port_file *pf, const char *ou
     fclose(fp);
 
     if (!count) {
-        printf("[skip] %s: no valid IPv4 targets\n", pf->name);
         free(targets);
         return 0;
     }
@@ -453,17 +473,13 @@ static int scan_file(const char *dir, const struct port_file *pf, const char *ou
     memset(&job, 0, sizeof(job));
     job.targets = targets;
     job.count = count;
+    job.next = 0;
     job.port = pf->port;
     job.timeout_ms = timeout_ms;
     job.output = output;
-    pthread_mutex_init(&job.lock, NULL);
+    job.g = g;
     clock_gettime(CLOCK_MONOTONIC, &job.started);
-
-    printf("\n[file] port=%d | file=%s | targets=%zu | threads=%d\n",
-           pf->port, pf->name, count, threads);
-    pthread_mutex_lock(&job.lock);
-    print_progress_locked(&job);
-    pthread_mutex_unlock(&job.lock);
+    pthread_mutex_init(&job.lock, NULL);
 
     ids = calloc((size_t)threads, sizeof(*ids));
     if (!ids) {
@@ -492,10 +508,6 @@ static int scan_file(const char *dir, const struct port_file *pf, const char *ou
         pthread_join(ids[i], NULL);
     }
 
-    printf("\n[port complete] %d | checked=%zu | found=%zu | elapsed=%.1fs\n",
-           pf->port, job.completed, job.found, elapsed_seconds(&job.started));
-    fflush(stdout);
-
     pthread_mutex_destroy(&job.lock);
     free(ids);
     free(targets);
@@ -510,9 +522,7 @@ int main(int argc, char **argv) {
     struct port_file *files = NULL;
     size_t file_count = 0;
     size_t total_targets = 0;
-    size_t done_targets = 0;
-    size_t found_total = 0;
-    struct timespec overall_started;
+    global_stats g;
     int rc = 0;
 
     signal(SIGPIPE, SIG_IGN);
@@ -558,62 +568,25 @@ int main(int argc, char **argv) {
         if (count_valid_targets(path, &c) == 0) total_targets += c;
     }
 
-    clock_gettime(CLOCK_MONOTONIC, &overall_started);
+    memset(&g, 0, sizeof(g));
+    clock_gettime(CLOCK_MONOTONIC, &g.started);
+    g.total = total_targets;
+    pthread_mutex_init(&g.lock, NULL);
+
     printf("[start] directory=%s | files=%zu | total_targets=%zu | requested_threads=%d\n",
            input, file_count, total_targets, threads);
 
     for (size_t i = 0; i < file_count; ++i) {
-        int port_rc;
-        double elapsed = elapsed_seconds(&overall_started);
-        double rate = elapsed > 0.0 ? (double)done_targets / elapsed : 0.0;
-        double remaining = (double)(total_targets - done_targets);
-        double eta = rate > 0.0 && remaining > 0.0 ? remaining / rate : -1.0;
-        char eta_text[32];
-        format_eta(eta, eta_text, sizeof(eta_text));
-        printf("\r[overall] file %zu/%zu | checked=%zu/%zu (%.2f%%) | found=%zu | ETA: %s",
-               i + 1,
-               file_count,
-               done_targets,
-               total_targets,
-               total_targets ? 100.0 * (double)done_targets / (double)total_targets : 100.0,
-               found_total,
-               eta_text);
-        fflush(stdout);
-
-        port_rc = scan_file(input, &files[i], output, threads, timeout);
-        if (port_rc != 0) rc = 1;
-
-        /* Recompute progress after this file; the per-file scan itself holds the tighter progress display. */
-        {
-            char path[1024];
-            size_t port_count = 0;
-            if (snprintf(path, sizeof(path), "%s/%s", input, files[i].name) >= (int)sizeof(path)) {
-                port_count = 0;
-            } else if (count_valid_targets(path, &port_count) == 0) {
-                done_targets += port_count;
-            }
-        }
-
-        {
-            char version_dir[1024];
-            char summary_path[1200];
-            snprintf(version_dir, sizeof(version_dir), "%s/unknown", output);
-            snprintf(summary_path, sizeof(summary_path), "%s/%d.txt", version_dir, files[i].port);
-            (void)summary_path;
-        }
-
-        /* file-level result tracking is done inside scan_file, and found_total is updated per-file to keep totals visible */
-        {
-            char buf[1024];
-            snprintf(buf, sizeof(buf), "%s/unknown", output);
-            (void)buf;
+        if (scan_file(input, &files[i], output, threads, timeout, &g) != 0) {
+            rc = 1;
         }
     }
 
     printf("\n[complete] files=%zu/%zu | checked=%zu/%zu | found=%zu | elapsed=%.1fs\n",
-           file_count, file_count, total_targets, total_targets, found_total,
-           elapsed_seconds(&overall_started));
+           file_count, file_count, g.checked, g.total, g.found, elapsed_seconds(&g.started));
+    fflush(stdout);
 
+    pthread_mutex_destroy(&g.lock);
     free(files);
     return rc;
 }
