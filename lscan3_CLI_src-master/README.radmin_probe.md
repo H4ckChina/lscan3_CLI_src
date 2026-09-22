@@ -1,13 +1,12 @@
-# Single-line progress output
+# Fix overall single-line progress
 
-The probe no longer needs to print a separate `[found]` line. Apply the change to an existing checkout with:
+Run this once after pulling the repository:
 
 ```sh
-cd lscan3_CLI_src
-./lscan3_CLI_src-master/apply_single_line_progress.sh lscan3_CLI_src-master/radmin_probe.c
-cd lscan3_CLI_src-master
+cd ~/lscan3_CLI_src/lscan3_CLI_src-master
+python3 fix_overall_progress.py
 make -f Makefile.radmin_probe clean
 make -f Makefile.radmin_probe
 ```
 
-The script creates `radmin_probe.c.bak`, removes the extra `[found]` newline output, and makes the progress line clear and repaint itself using `\033[2K\r`.
+The patch makes the main probe use one global progress line. `checked`, `remaining`, `ETA`, and `found` are updated for every target across all port files; discovery no longer creates extra terminal lines.
