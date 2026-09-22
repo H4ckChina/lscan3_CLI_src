@@ -1,8 +1,6 @@
 # Linux Radmin service/version probe
 
-This directory contains `radmin_probe`, a Linux-only, non-authenticating Radmin service fingerprinting tool.
-
-It sends only the unauthenticated Radmin version request and records confirmed responses. It does not attempt passwords, usernames, hashes, or any authentication exchange.
+This is a Linux-only, non-authenticating Radmin service fingerprinting tool.
 
 ## Build
 
@@ -15,10 +13,12 @@ make -f Makefile.radmin_probe
 The input file contains one IPv4 address per line. Blank lines and lines beginning with `#` are ignored.
 
 ```sh
-./radmin_probe -i targets.txt -p 4899 -o ./results -t 8
+./radmin_probe -i targets.txt -p 4899 -o ./results -t 32
 ```
 
-Output is organized as requested:
+`-t` accepts 1-1024 worker threads. The program prints progress for every completed target and reports thread creation failures instead of silently ignoring them.
+
+Output is organized by detected version and port:
 
 ```text
 results/

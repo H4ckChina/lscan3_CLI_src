@@ -22,12 +22,15 @@
 #define DEFAULT_PORT 4899
 #define DEFAULT_TIMEOUT_MS 3000
 #define DEFAULT_THREADS 4
+#define MAX_THREADS 1024
 
 struct target { char ip[INET_ADDRSTRLEN]; };
 struct job {
     struct target *targets;
     size_t count;
     size_t next;
+    size_t completed;
+    size_t found;
     int port;
     int timeout_ms;
     const char *output;
@@ -36,6 +39,7 @@ struct job {
 
 static void usage(const char *name) {
     fprintf(stderr, "Usage: %s -i targets.txt [-p port] [-o dir] [-t threads] [-w timeout_ms]\n", name);
+    fprintf(stderr, "  -t accepts 1-%d worker threads\n", MAX_THREADS);
 }
 
 static int mkdir_one(const char *path) {
@@ -87,7 +91,6 @@ static uint32_t le32(const unsigned char *p) {
            ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
-/* Matches the checksum used by the original Radmin packet implementation. */
 static uint32_t radmin_crc(const unsigned char *p, size_t len) {
     uint32_t sum = 0;
     while (len) {
@@ -122,27 +125,25 @@ static int connect_target(const char *ip, int port, int timeout_ms) {
     return fd;
 }
 
-/* Returns 1 for a confirmed Radmin response, 0 otherwise. */
 static int probe(const char *ip, int port, int timeout_ms, char *version, size_t version_len) {
-    unsigned char request[5] = { 0x01, 0, 0, 0, 0 };
     unsigned char header[9], *block = NULL;
     int fd = connect_target(ip, port, timeout_ms);
     uint32_t block_len, sent_crc, actual_crc;
     int result = 0;
     if (fd < 0) return 0;
-    /* Header: marker=1, network-order block length, network-order checksum. */
-    { uint32_t len = htonl(5), crc = htonl(radmin_crc(request + 0, 5));
-      memcpy(request + 1, &len, 4); /* overwritten below with the actual packet */
-      (void)crc;
-    }
-    /* The request block is code 0x08 with zero data. */
-    { unsigned char out_header[9]; uint32_t len = htonl(5), crc;
-      unsigned char block_out[5] = { 0x08, 0, 0, 0, 0 };
-      crc = htonl(radmin_crc(block_out, 5));
-      out_header[0] = 1; memcpy(out_header + 1, &len, 4); memcpy(out_header + 5, &crc, 4);
-      if (!write_full(fd, out_header, sizeof(out_header), timeout_ms) ||
-          !write_full(fd, block_out, sizeof(block_out), timeout_ms) ||
-          !read_full(fd, header, sizeof(header), timeout_ms)) goto done;
+
+    /* Radmin version request: packet code 0x08 with no payload. */
+    {
+        unsigned char out_header[9];
+        unsigned char block_out[1] = { 0x08 };
+        uint32_t len = htonl(1);
+        uint32_t crc = htonl(radmin_crc(block_out, sizeof(block_out)));
+        out_header[0] = 1;
+        memcpy(out_header + 1, &len, 4);
+        memcpy(out_header + 5, &crc, 4);
+        if (!write_full(fd, out_header, sizeof(out_header), timeout_ms) ||
+            !write_full(fd, block_out, sizeof(block_out), timeout_ms) ||
+            !read_full(fd, header, sizeof(header), timeout_ms)) goto done;
     }
     if (header[0] != 1) goto done;
     memcpy(&block_len, header + 1, 4); block_len = ntohl(block_len);
@@ -158,7 +159,9 @@ static int probe(const char *ip, int port, int timeout_ms, char *version, size_t
         switch (flags & 0x0A000003U) {
         case 0x08000000U: case 0x08000001U:
             switch (flags & 0x00080001U) {
-            case 0: v = "2.0"; break; case 0x00080001U: v = "2.1"; break; case 1: v = "2.2"; break;
+            case 0: v = "2.0"; break;
+            case 0x00080001U: v = "2.1"; break;
+            case 1: v = "2.2"; break;
             }
             break;
         case 0x0A000002U: v = "3"; break;
@@ -182,17 +185,19 @@ static void record_target(const struct job *j, const char *ip, const char *versi
 static void *worker(void *arg) {
     struct job *j = arg;
     for (;;) {
-        size_t index; char version[16];
+        size_t index; char version[16]; int found = 0;
         pthread_mutex_lock(&j->lock);
         if (j->next >= j->count) { pthread_mutex_unlock(&j->lock); break; }
         index = j->next++;
         pthread_mutex_unlock(&j->lock);
-        if (probe(j->targets[index].ip, j->port, j->timeout_ms, version, sizeof(version))) {
-            pthread_mutex_lock(&j->lock);
-            record_target(j, j->targets[index].ip, version);
-            pthread_mutex_unlock(&j->lock);
-            printf("%s:%d -> Radmin %s\n", j->targets[index].ip, j->port, version);
-        }
+        found = probe(j->targets[index].ip, j->port, j->timeout_ms, version, sizeof(version));
+        pthread_mutex_lock(&j->lock);
+        j->completed++;
+        if (found) { record_target(j, j->targets[index].ip, version); j->found++; }
+        printf("[progress] %zu/%zu checked, found=%zu\n", j->completed, j->count, j->found);
+        if (found) printf("[found] %s:%d -> Radmin %s\n", j->targets[index].ip, j->port, version);
+        fflush(stdout);
+        pthread_mutex_unlock(&j->lock);
     }
     return NULL;
 }
@@ -201,7 +206,7 @@ int main(int argc, char **argv) {
     const char *input = NULL, *output = "./results";
     int port = DEFAULT_PORT, timeout = DEFAULT_TIMEOUT_MS, threads = DEFAULT_THREADS, opt;
     struct target *targets = NULL; size_t count = 0, cap = 0; FILE *fp; char line[MAX_LINE];
-    pthread_t *ids; struct job job;
+    pthread_t *ids; struct job job; int created = 0;
     signal(SIGPIPE, SIG_IGN);
     while ((opt = getopt(argc, argv, "i:p:o:t:w:h")) != -1) {
         switch (opt) {
@@ -210,7 +215,7 @@ int main(int argc, char **argv) {
         case 'w': timeout = atoi(optarg); break; default: usage(argv[0]); return opt == 'h' ? 0 : 2;
         }
     }
-    if (!input || port < 1 || port > 65535 || threads < 1 || threads > 128 || timeout < 100) { usage(argv[0]); return 2; }
+    if (!input || port < 1 || port > 65535 || threads < 1 || threads > MAX_THREADS || timeout < 100) { usage(argv[0]); return 2; }
     fp = fopen(input, "r"); if (!fp) { perror(input); return 1; }
     while (fgets(line, sizeof(line), fp)) {
         char *p = line; size_t n;
@@ -218,13 +223,23 @@ int main(int argc, char **argv) {
         n = strcspn(p, " \t\r\n#"); p[n] = 0;
         if (!*p) continue;
         { struct in_addr a; if (inet_pton(AF_INET, p, &a) != 1) continue; }
-        if (count == cap) { cap = cap ? cap * 2 : 256; targets = realloc(targets, cap * sizeof(*targets)); if (!targets) return 1; }
-        snprintf(targets[count++].ip, sizeof(targets[count].ip), "%s", p);
+        if (count == cap) {
+            struct target *tmp;
+            cap = cap ? cap * 2 : 256; tmp = realloc(targets, cap * sizeof(*targets));
+            if (!tmp) { free(targets); fclose(fp); return 1; } targets = tmp;
+        }
+        snprintf(targets[count].ip, sizeof(targets[count].ip), "%s", p); count++;
     }
     fclose(fp); if (!count) { fprintf(stderr, "No valid IPv4 targets.\n"); free(targets); return 1; }
     memset(&job, 0, sizeof(job)); job.targets = targets; job.count = count; job.port = port; job.timeout_ms = timeout; job.output = output; pthread_mutex_init(&job.lock, NULL);
-    ids = calloc((size_t)threads, sizeof(*ids)); if (!ids) return 1;
-    for (int i = 0; i < threads; ++i) pthread_create(&ids[i], NULL, worker, &job);
-    for (int i = 0; i < threads; ++i) pthread_join(ids[i], NULL);
-    pthread_mutex_destroy(&job.lock); free(ids); free(targets); return 0;
+    ids = calloc((size_t)threads, sizeof(*ids)); if (!ids) { pthread_mutex_destroy(&job.lock); free(targets); return 1; }
+    for (int i = 0; i < threads; ++i) {
+        int rc = pthread_create(&ids[created], NULL, worker, &job);
+        if (rc != 0) { fprintf(stderr, "pthread_create failed at %d/%d: %s\n", i + 1, threads, strerror(rc)); break; }
+        created++;
+    }
+    for (int i = 0; i < created; ++i) pthread_join(ids[i], NULL);
+    pthread_mutex_destroy(&job.lock); free(ids); free(targets);
+    fprintf(stderr, "Scan complete: %zu checked, %zu Radmin services found.\n", job.completed, job.found);
+    return created > 0 ? 0 : 1;
 }
