@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
@@ -22,7 +23,6 @@
 #define DEFAULT_PORT 4899
 #define DEFAULT_TIMEOUT_MS 3000
 #define DEFAULT_THREADS 4
-#define MAX_THREADS 1024
 
 struct target { char ip[INET_ADDRSTRLEN]; };
 struct job {
@@ -39,7 +39,7 @@ struct job {
 
 static void usage(const char *name) {
     fprintf(stderr, "Usage: %s -i targets.txt [-p port] [-o dir] [-t threads] [-w timeout_ms]\n", name);
-    fprintf(stderr, "  -t accepts 1-%d worker threads\n", MAX_THREADS);
+    fprintf(stderr, "  -t accepts any positive value; the OS may limit the actual number created\n");
 }
 
 static int mkdir_one(const char *path) {
@@ -182,7 +182,6 @@ static void record_target(const struct job *j, const char *ip, const char *versi
     fprintf(fp, "%s\n", ip); fclose(fp);
 }
 
-/* Called while j->lock is held. The carriage return keeps the status live on one terminal line. */
 static void print_progress_locked(const struct job *j) {
     size_t remaining = j->count - j->completed;
     double done_pct = j->count ? (100.0 * (double)j->completed / (double)j->count) : 100.0;
@@ -224,7 +223,8 @@ int main(int argc, char **argv) {
         case 'w': timeout = atoi(optarg); break; default: usage(argv[0]); return opt == 'h' ? 0 : 2;
         }
     }
-    if (!input || port < 1 || port > 65535 || threads < 1 || threads > MAX_THREADS || timeout < 100) { usage(argv[0]); return 2; }
+    /* No artificial 1024-thread ceiling: any positive int is accepted. */
+    if (!input || port < 1 || port > 65535 || threads < 1 || timeout < 100) { usage(argv[0]); return 2; }
     fp = fopen(input, "r"); if (!fp) { perror(input); return 1; }
     while (fgets(line, sizeof(line), fp)) {
         char *p = line; size_t n;
@@ -241,9 +241,10 @@ int main(int argc, char **argv) {
     }
     fclose(fp); if (!count) { fprintf(stderr, "No valid IPv4 targets.\n"); free(targets); return 1; }
     memset(&job, 0, sizeof(job)); job.targets = targets; job.count = count; job.port = port; job.timeout_ms = timeout; job.output = output; pthread_mutex_init(&job.lock, NULL);
-    printf("[start] targets: %zu | threads: %d | port: %d\n", count, threads, port);
+    printf("[start] targets: %zu | requested threads: %d | port: %d\n", count, threads, port);
     print_progress_locked(&job);
-    ids = calloc((size_t)threads, sizeof(*ids)); if (!ids) { pthread_mutex_destroy(&job.lock); free(targets); return 1; }
+    if ((size_t)threads > SIZE_MAX / sizeof(*ids)) { fprintf(stderr, "Too many threads for allocation.\n"); pthread_mutex_destroy(&job.lock); free(targets); return 1; }
+    ids = calloc((size_t)threads, sizeof(*ids)); if (!ids) { perror("calloc thread handles"); pthread_mutex_destroy(&job.lock); free(targets); return 1; }
     for (int i = 0; i < threads; ++i) {
         int rc = pthread_create(&ids[created], NULL, worker, &job);
         if (rc != 0) { fprintf(stderr, "\npthread_create failed at %d/%d: %s\n", i + 1, threads, strerror(rc)); break; }
