@@ -1,0 +1,13 @@
+CC ?= cc
+CFLAGS ?= -O2 -Wall -Wextra -pedantic
+LDLIBS ?= -pthread
+
+.PHONY: all clean
+
+all: radmin_probe
+
+radmin_probe: radmin_probe.c
+	$(CC) $(CFLAGS) -std=c11 -o $@ $< $(LDLIBS)
+
+clean:
+	rm -f radmin_probe
