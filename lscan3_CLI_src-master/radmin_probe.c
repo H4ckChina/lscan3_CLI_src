@@ -182,6 +182,16 @@ static void record_target(const struct job *j, const char *ip, const char *versi
     fprintf(fp, "%s\n", ip); fclose(fp);
 }
 
+/* Called while j->lock is held. The carriage return keeps the status live on one terminal line. */
+static void print_progress_locked(const struct job *j) {
+    size_t remaining = j->count - j->completed;
+    double done_pct = j->count ? (100.0 * (double)j->completed / (double)j->count) : 100.0;
+    double remaining_pct = 100.0 - done_pct;
+    printf("\r[progress] checked: %zu/%zu (%.2f%%) | remaining: %zu (%.2f%%) | found: %zu",
+           j->completed, j->count, done_pct, remaining, remaining_pct, j->found);
+    fflush(stdout);
+}
+
 static void *worker(void *arg) {
     struct job *j = arg;
     for (;;) {
@@ -194,9 +204,8 @@ static void *worker(void *arg) {
         pthread_mutex_lock(&j->lock);
         j->completed++;
         if (found) { record_target(j, j->targets[index].ip, version); j->found++; }
-        printf("[progress] %zu/%zu checked, found=%zu\n", j->completed, j->count, j->found);
-        if (found) printf("[found] %s:%d -> Radmin %s\n", j->targets[index].ip, j->port, version);
-        fflush(stdout);
+        if (found) printf("\n[found] %s:%d -> Radmin %s\n", j->targets[index].ip, j->port, version);
+        print_progress_locked(j);
         pthread_mutex_unlock(&j->lock);
     }
     return NULL;
@@ -232,14 +241,17 @@ int main(int argc, char **argv) {
     }
     fclose(fp); if (!count) { fprintf(stderr, "No valid IPv4 targets.\n"); free(targets); return 1; }
     memset(&job, 0, sizeof(job)); job.targets = targets; job.count = count; job.port = port; job.timeout_ms = timeout; job.output = output; pthread_mutex_init(&job.lock, NULL);
+    printf("[start] targets: %zu | threads: %d | port: %d\n", count, threads, port);
+    print_progress_locked(&job);
     ids = calloc((size_t)threads, sizeof(*ids)); if (!ids) { pthread_mutex_destroy(&job.lock); free(targets); return 1; }
     for (int i = 0; i < threads; ++i) {
         int rc = pthread_create(&ids[created], NULL, worker, &job);
-        if (rc != 0) { fprintf(stderr, "pthread_create failed at %d/%d: %s\n", i + 1, threads, strerror(rc)); break; }
+        if (rc != 0) { fprintf(stderr, "\npthread_create failed at %d/%d: %s\n", i + 1, threads, strerror(rc)); break; }
         created++;
     }
     for (int i = 0; i < created; ++i) pthread_join(ids[i], NULL);
+    printf("\n");
     pthread_mutex_destroy(&job.lock); free(ids); free(targets);
-    fprintf(stderr, "Scan complete: %zu checked, %zu Radmin services found.\n", job.completed, job.found);
+    fprintf(stderr, "Scan complete: %zu checked, %zu remaining, %zu Radmin services found.\n", job.completed, job.count - job.completed, job.found);
     return created > 0 ? 0 : 1;
 }
